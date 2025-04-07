@@ -1,0 +1,265 @@
+---
+title: "Predicting Fast-Growing Firms (Assignment 3)"
+author: "Your Name"
+date: "2025-04-06"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: readable
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(caret)
+library(ggplot2)
+library(knitr)
+library(readr)
+library(tidyverse)
+library(pROC)
+```
+
+## Load and Prepare Data
+
+```{r load-data}
+panel_df <- read_csv("D:/CEU_MA_EDP/Winter 2025/Prediction/Assignment 3/cs_bisnode_panel.csv", show_col_types = FALSE)
+```
+
+The goal of this project was to develop a predictive model for identifying fast-growing firms using panel data from the Bisnode database (2010–2015). The assignment required us to define a custom target variable for fast growth, build and evaluate three classification models (including one logit and one random forest), and apply a custom loss function for classification evaluation. Finally, model performance was compared across two industry sectors: manufacturing and services.
+
+We used the cs_bisnode_panel.csv dataset, which includes firm-level balance sheet and demographic data for Hungarian companies from 2010 to 2015. Fast growth was defined as a firm having at least a 20% increase in log sales between 2012 and 2014. This was translated into a binary target variable fast_growth.
+```{r prepare-growth}
+sales_df <- panel_df %>%
+  filter(year %in% c(2012, 2014)) %>%
+  filter(!is.na(sales) & sales > 0) %>%
+  mutate(sales_log = log(sales)) %>%
+  select(comp_id, year, sales_log) %>%
+  pivot_wider(names_from = year, values_from = sales_log, names_prefix = "sales_log_") %>%
+  filter(!is.na(sales_log_2012) & !is.na(sales_log_2014)) %>%
+  mutate(growth = sales_log_2014 - sales_log_2012)
+
+threshold <- quantile(sales_df$growth, 0.80, na.rm = TRUE)
+sales_df <- sales_df %>%
+  mutate(fast_growth = if_else(growth >= threshold, 1, 0))
+```
+
+## Merge with Features
+
+```{r merge-features}
+model_df <- panel_df %>%
+  filter(year == 2012) %>%
+  left_join(sales_df %>% select(comp_id, fast_growth), by = "comp_id") %>%
+  filter(!is.na(fast_growth)) %>%
+  select(comp_id, fast_growth, sales, curr_assets, fixed_assets, liq_assets,
+         profit_loss_year, personnel_exp, ceo_count, foreign, female,
+         birth_year, inoffice_days, region_m, ind2, ind) %>%
+  drop_na()
+
+model_df$fast_growth <- factor(model_df$fast_growth, levels = c(0,1), labels = c("No", "Yes"))
+```
+
+## Train Models
+
+Three models were trained and evaluated using 5-fold cross-validation:
+1. Logistic Regression (Logit)
+2. Classification and Regression Tree (CART)
+3. Random Forest (RF)
+
+```{r Train Model}
+set.seed(123)
+ctrl <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+logit_model <- train(fast_growth ~ . -comp_id, data = model_df, method = "glm", family = "binomial", trControl = ctrl, metric = "ROC")
+
+cart_model <- train(fast_growth ~ . -comp_id, data = model_df, method = "rpart", trControl = ctrl, metric = "ROC", tuneLength = 10)
+# CART complexity vs ROC
+plot(cart_model, main = "CART Model: Complexity Parameter vs ROC")
+
+rf_model <- train(fast_growth ~ . -comp_id, data = model_df, method = "rf", trControl = ctrl, metric = "ROC", tuneLength = 5)
+# Random Forest mtry vs ROC
+plot(rf_model, main = "Random Forest: mtry vs ROC")
+```
+
+## Model Performance
+
+The random forest clearly outperformed other models with a near-perfect classification under the defined loss function.
+
+```{r model-performance}
+model_results <- data.frame(
+  Model = c("Logit", "CART", "Random Forest"),
+  AUC_ROC = c(0.687, 0.674, 0.757),
+  Sensitivity = c(0.998, 1.000, 1.000),
+  Specificity = c(0.006, 0.000, 0.999),
+  Best_Threshold = c(0.09, 0.05, 0.40),
+  Expected_Loss = c(10540, 11061, 7)
+)
+kable(model_results, caption = "Model Performance Comparison (Overall)")
+```
+## Plot ROC Curves (Extra Credit Style 🎯)
+
+```{r plot-roc-curves}
+# Get predicted probabilities
+logit_probs <- predict(logit_model, model_df, type = "prob")[, "Yes"]
+cart_probs <- predict(cart_model, model_df, type = "prob")[, "Yes"]
+rf_probs   <- predict(rf_model, model_df, type = "prob")[, "Yes"]
+
+# Convert outcome to numeric
+actuals <- ifelse(model_df$fast_growth == "Yes", 1, 0)
+
+# ROC objects
+roc_logit <- roc(actuals, logit_probs)
+roc_cart  <- roc(actuals, cart_probs)
+roc_rf    <- roc(actuals, rf_probs)
+
+# Plot all ROC curves
+plot(roc_logit, col = "blue", main = "ROC Curves for All Models")
+lines(roc_cart, col = "green")
+lines(roc_rf, col = "red")
+legend("bottomright", legend = c("Logit", "CART", "Random Forest"), col = c("blue", "green", "red"), lwd = 2)
+```
+
+## Threshold Tuning & Expected Loss
+
+```{r loss-function}
+tune_threshold <- function(probs, actual, cost_fp = 1, cost_fn = 10, return_all = FALSE) {
+  thresholds <- seq(0.01, 0.99, 0.01)
+  loss_df <- data.frame(threshold = thresholds, expected_loss = NA)
+  for (i in seq_along(thresholds)) {
+    pred <- ifelse(probs > thresholds[i], "Yes", "No")
+    cm <- table(factor(pred, levels = c("No", "Yes")), factor(actual, levels = c("No", "Yes")))
+    FP <- ifelse(is.na(cm["Yes", "No"]), 0, cm["Yes", "No"])
+    FN <- ifelse(is.na(cm["No", "Yes"]), 0, cm["No", "Yes"])
+    loss_df$expected_loss[i] <- FP * cost_fp + FN * cost_fn
+  }
+  if (return_all) {
+    return(loss_df)
+  } else {
+    return(loss_df %>% filter(expected_loss == min(expected_loss)))
+  }
+}
+
+probs_logit <- predict(logit_model, model_df, type = "prob")[, "Yes"]
+probs_cart  <- predict(cart_model, model_df, type = "prob")[, "Yes"]
+probs_rf    <- predict(rf_model, model_df, type = "prob")[, "Yes"]
+
+logit_loss_df <- tune_threshold(probs_logit, model_df$fast_growth, return_all = TRUE)
+cart_loss_df  <- tune_threshold(probs_cart,  model_df$fast_growth, return_all = TRUE)
+rf_loss_df    <- tune_threshold(probs_rf,    model_df$fast_growth, return_all = TRUE)
+
+# Then pick best ones
+logit_loss <- logit_loss_df %>% filter(expected_loss == min(expected_loss))
+cart_loss  <- cart_loss_df  %>% filter(expected_loss == min(expected_loss))
+rf_loss    <- rf_loss_df    %>% filter(expected_loss == min(expected_loss))
+
+
+logit_loss
+cart_loss
+rf_loss
+```
+### Plot Expected Loss Curves for Each Model
+
+```{r expected-loss-curves, fig.height=4.5, fig.width=7}
+# Combine into a single plot frame
+logit_loss_df$model <- "Logit"
+cart_loss_df$model <- "CART"
+rf_loss_df$model <- "Random Forest"
+all_loss_df <- bind_rows(logit_loss_df, cart_loss_df, rf_loss_df)
+
+# Plot
+ggplot(all_loss_df, aes(x = threshold, y = expected_loss, color = model)) +
+  geom_line() +
+  labs(title = "Expected Loss vs Threshold by Model",
+       x = "Classification Threshold",
+       y = "Expected Loss ($)") +
+  theme_minimal()
+```
+
+### Generate Confusion Tables at Best Thresholds 
+```{r Confusion Tables}
+# Set actual values once
+logit_actual <- cart_actual <- rf_actual <- model_df$fast_growth
+
+# LOGIT CONFUSION TABLE at 0.09
+logit_preds <- ifelse(logit_probs > 0.09, "Yes", "No")
+logit_cm <- table(Predicted = factor(logit_preds, levels = c("No", "Yes")),
+                  Actual = factor(logit_actual, levels = c("No", "Yes")))
+cat("\n--- Logit Confusion Table (Threshold = 0.09) ---\n")
+print(logit_cm)
+
+# CART CONFUSION TABLE at 0.05 (midpoint of flat minimum)
+cart_preds <- ifelse(cart_probs > 0.05, "Yes", "No")
+cart_cm <- table(Predicted = factor(cart_preds, levels = c("No", "Yes")),
+                 Actual = factor(cart_actual, levels = c("No", "Yes")))
+cat("\n--- CART Confusion Table (Threshold = 0.05) ---\n")
+print(cart_cm)
+
+# RANDOM FOREST CONFUSION TABLE at 0.40
+rf_preds <- ifelse(rf_probs > 0.40, "Yes", "No")
+rf_cm <- table(Predicted = factor(rf_preds, levels = c("No", "Yes")),
+               Actual = factor(rf_actual, levels = c("No", "Yes")))
+cat("\n--- Random Forest Confusion Table (Threshold = 0.40) ---\n")
+print(rf_cm)
+
+```
+
+## Industry Comparison
+We split the dataset into two groups based on industry codes (ind2):
+- Manufacturing (ind2 = 10–33)
+- Services (ind2 = 55, 56, 95)
+
+```{r industry-comparison}
+manufacturing_df <- model_df %>% filter(ind2 >= 10 & ind2 <= 33)
+services_df <- model_df %>% filter(ind2 %in% c(55, 56, 95))
+
+rf_manuf <- train(fast_growth ~ . -comp_id -ind2 -ind -region_m, data = manufacturing_df, method = "rf", trControl = ctrl, metric = "ROC")
+rf_serv  <- train(fast_growth ~ . -comp_id -ind2 -ind -region_m, data = services_df, method = "rf", trControl = ctrl, metric = "ROC")
+
+probs_manuf <- predict(rf_manuf, manufacturing_df, type = "prob")[, "Yes"]
+probs_serv  <- predict(rf_serv,  services_df,      type = "prob")[, "Yes"]
+
+manuf_loss <- tune_threshold(probs_manuf, manufacturing_df$fast_growth)
+serv_loss  <- tune_threshold(probs_serv,  services_df$fast_growth)
+
+industry_results <- data.frame(
+  Sector = c("Manufacturing", "Services"),
+  AUC_ROC = c(0.692, 0.784),
+  Best_Threshold_Range = c("0.34–0.56", "0.39–0.55"),
+  Expected_Loss = c(0, 0),
+  Model_Accuracy = c("Perfect", "Perfect")
+)
+kable(industry_results, caption = "Table: Performance of Random Forest by Industry Group")
+```
+
+
+
+Separate random forest models were trained for each group. Both achieved perfect classification with expected loss = $0 across wide threshold ranges. AUC scores showed services had stronger predictability.
+
+```{r industry-threshold-plot, fig.height=4.5, fig.width=7}
+manuf_loss_df <- tune_threshold(probs_manuf, manufacturing_df$fast_growth, return_all = TRUE)
+serv_loss_df  <- tune_threshold(probs_serv,  services_df$fast_growth, return_all = TRUE)
+# Add industry labels
+manuf_loss_df$industry <- "Manufacturing"
+serv_loss_df$industry  <- "Services"
+
+industry_loss_df <- bind_rows(manuf_loss_df, serv_loss_df)
+
+ggplot(industry_loss_df, aes(x = threshold, y = expected_loss, color = industry)) +
+  geom_line(linewidth = 1.1) +
+  labs(title = "Expected Loss by Threshold — Industry Comparison",
+       x = "Classification Threshold",
+       y = "Expected Loss ($)") +
+  theme_minimal()
+```
+
+## Conclusion
+
+- Random forest outperformed other models across the board.
+- Services sector showed stronger predictive performance than manufacturing.
+- Custom loss evaluation helped identify thresholds with zero expected loss in both sectors.
+
+---
+
+GitHub Repository [https://github.com/Nahian2400062/Ibnat_Prediction_Assignment-3.git]
