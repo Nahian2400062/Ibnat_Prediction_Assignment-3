@@ -1,5 +1,3 @@
-# Ibnat_Prediction_Assignment-3
-
 # 🚀 Predicting Fast-Growing Firms — Assignment 3
 
 Author: **Nahian Ibnat**  
